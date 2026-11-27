@@ -862,9 +862,45 @@ function deflateOptimal(data, rowLen, chain, rounds) {
   return stream;
 }
 
+const BAND_ROWS = 30;
+
+/**
+ * A stream mixed band by band from sibling streams of the same form: for
+ * each band of BAND_ROWS rows, the sibling whose slice compresses smallest
+ * against the stream written so far (zlib level 6 with the last 32 KiB as
+ * dictionary). Filter strategies disagree by region — window chrome wants
+ * one, photo patches another — and no single strategy is right everywhere;
+ * mixing at band granularity recovered several percent on rich and alpha
+ * images over the best single strategy.
+ */
+function bandMix(siblings, width, height, bpp) {
+  const rowBytes = width * bpp + 1;
+  const out = new Uint8Array(height * rowBytes);
+  const names = Object.keys(siblings);
+  for (let y0 = 0; y0 < height; y0 += BAND_ROWS) {
+    const y1 = Math.min(height, y0 + BAND_ROWS);
+    const at = y0 * rowBytes;
+    const tail = out.subarray(Math.max(0, at - 32768), at);
+    let bestName = null;
+    let bestCost = Infinity;
+    for (const name of names) {
+      const slice = siblings[name].subarray(y0 * rowBytes, y1 * rowBytes);
+      const z = tail.length === 0
+        ? deflateSync(slice, { level: 6, memLevel: 9 })
+        : deflateSync(slice, { level: 6, memLevel: 9, dictionary: tail });
+      if (z.length < bestCost) {
+        bestCost = z.length;
+        bestName = name;
+      }
+    }
+    out.set(siblings[bestName].subarray(y0 * rowBytes, y1 * rowBytes), at);
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------------- forms
 
-const CHANNEL_FILTERS = [0, 1, 2, 3, 4, 'minsum', 'pairs', 'brute', 'oracle'];
+const CHANNEL_FILTERS = [0, 1, 2, 3, 4, 'minsum', 'brute', 'oracle', 'bandmix'];
 
 /** Every lossless form worth screening for this image. */
 function formsOf(rgba) {
@@ -909,16 +945,34 @@ function squeeze(image) {
   const { width, height, rgba } = image;
   let best = null;
   let bestAlt = null;
+  let bestFixed = null;
   for (const form of formsOf(rgba)) {
     const extra = chunkBytes(form) + PNG_FIXED;
+    const siblings = {};
+    let wantBandMix = false;
     for (const choice of form.filters) {
+      if (choice === 'bandmix') {
+        wantBandMix = true;
+        continue;
+      }
       const data = filtered(form.samples, width, height, form.bpp, choice);
+      siblings[String(choice)] = data;
       const z = deflateSync(data, SCREEN_OPTS);
       const bytes = z.length + extra;
       if (best === null || bytes < best.bytes) best = { form, data, bytes, choice };
+      if (typeof choice === 'number' && (bestFixed === null || bytes < bestFixed.bytes)) {
+        bestFixed = { form, data, bytes, choice };
+      }
       if ((choice === 'brute' || choice === 'oracle') && (bestAlt === null || bytes < bestAlt.bytes)) {
         bestAlt = { form, data, bytes, choice };
       }
+    }
+    if (wantBandMix) {
+      const data = bandMix(siblings, width, height, form.bpp);
+      const z = deflateSync(data, SCREEN_OPTS);
+      const bytes = z.length + extra;
+      if (best === null || bytes < best.bytes) best = { form, data, bytes, choice: 'bandmix' };
+      if (bestAlt === null || bytes < bestAlt.bytes) bestAlt = { form, data, bytes, choice: 'bandmix' };
     }
   }
   // Final encodings of the screen winner: zlib at level 9 under two
@@ -955,6 +1009,20 @@ function squeeze(image) {
     !(best.choice === 0 && bestAlt.bytes > best.bytes * 0.995)
   ) {
     consider(bestAlt.form, dpOf(bestAlt, bestAlt.form.bpp === 1 ? 512 : 384));
+  }
+  // The level-6 screen can rank an adaptive stream above a fixed one whose
+  // optimal parse is actually smaller (the grey images flip this way), so
+  // when an adaptive stream won the screen, the best fixed stream of a
+  // one-byte-per-pixel form still gets its parse if it screened within
+  // three percent. (One-byte parses are the cheap ones.)
+  if (
+    typeof best.choice !== 'number' &&
+    bestFixed !== null &&
+    bestFixed.data !== best.data &&
+    bestFixed.bytes <= best.bytes * 1.03 &&
+    bestFixed.form.bpp === 1
+  ) {
+    consider(bestFixed.form, dpOf(bestFixed, 1024));
   }
   winForm = idat.form;
   const chunks = [['IHDR', ihdrOf(width, height, winForm.colourType)]];
