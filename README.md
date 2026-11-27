@@ -22,11 +22,19 @@ smallest result to `/output/<id>/image.png`:
   single-transparent-colour tRNS key forms (types 0/2 without an alpha
   channel) when the only transparency is one exact colour at alpha 0.
 - **Filter strategies** — each fixed filter (None, Sub, Up, Average, Paeth),
-  a per-row minimum-signed-sum choice, and a per-row fewest-distinct-pairs
-  choice, applied to every form.
+  a per-row minimum-signed-sum choice, a per-row fewest-distinct-pairs
+  choice, and a brute-force per-row choice (the filter whose row compresses
+  smallest against the 32 KiB of stream already written), applied to every
+  form.
 - **Weighing** — every candidate's filtered stream is compressed with zlib at
-  level 6 and weighed with its PLTE/tRNS chunk bytes; the winner is rewritten
-  with the best of three level-9 zlib settings.
+  level 6 and weighed with its PLTE/tRNS chunk bytes.
+- **Final encoding** — the winner is rewritten with the best of three level-9
+  zlib settings and a built-in optimal-parsing deflate (zopfli-style: cached
+  candidate matches per position, a greedy parse to price the first Huffman
+  table, then two shortest-path parses repriced from the previous table,
+  emitted as dynamic-Huffman blocks per 512 KiB segment). Whichever stream
+  is smallest wins; when the brute-force stream screened within a percent of
+  the winner it gets the optimal-parsing treatment too, and the two stack.
 
 The search is a pure function of the input bytes — no clock, no randomness —
 so two runs of the program produce byte-identical output.
@@ -34,7 +42,7 @@ so two runs of the program produce byte-identical output.
 ## Practice result
 
 On the kit's practice set the program answers all 8 instances exactly and
-scores **702,184 / 1,000,000** under the kit's own scorer, against 420,399 for
+scores **727,703 / 1,000,000** under the kit's own scorer, against 420,399 for
 the house baseline (fixed-paeth 1.0.0) and 666,667 for the scale compressor
 that defines each instance's floor and target.
 
