@@ -564,14 +564,20 @@ function matchLen(data, a, b, max) {
   while (l < max && data[a + l] === data[b + l]) l++;
   return l;
 }
-const CANDS = 4; // candidate matches cached per position
+const NCLASS = SUB_LENGTHS.length;
 
-/** Candidate matches for every position of data[start, end), as CSR-style flat arrays. */
+/**
+ * Candidate matches for every position of data[start, end): for each useful
+ * length class, the nearest distance whose match reaches at least that
+ * length, plus the longest match overall. (An earlier frontier cache dropped
+ * nearer-but-shorter matches that are cheaper to encode than a farther
+ * longer one; per-class best distances keep both.)
+ */
 function findCandidates(data, start, end, maxChain, goodLen, probeDists) {
   const n = end - start;
-  const counts = new Uint8Array(n);
-  const candLen = new Uint16Array(n * CANDS);
-  const candDist = new Uint16Array(n * CANDS);
+  const subDist = new Uint16Array(n * NCLASS);
+  const maxLenA = new Uint16Array(n);
+  const maxDistA = new Uint16Array(n);
   const head = new Int32Array(HASH_SIZE).fill(-1);
   const prev = new Int32Array(data.length).fill(-1);
   const buildFrom = Math.max(0, start - 32768);
@@ -580,44 +586,52 @@ function findCandidates(data, start, end, maxChain, goodLen, probeDists) {
     prev[p] = head[h];
     head[h] = p;
   }
+  const classOf = (l) => {
+    let s = 0;
+    while (s + 1 < NCLASS && SUB_LENGTHS[s + 1] <= l) s++;
+    return s;
+  };
   for (let i = 0; i < n; i++) {
     const pos = start + i;
     if (pos + 3 <= end) {
       const maxL = Math.min(258, end - pos);
+      const base = i * NCLASS;
       let best = 2;
-      let kept = 0;
-      const base = i * CANDS;
+      let bestDist = 0;
+      const consider = (dist, l) => {
+        if (l < 3) return;
+        const top = classOf(l);
+        for (let s = 0; s <= top; s++) if (subDist[base + s] === 0) subDist[base + s] = dist;
+        if (l > best) {
+          best = l;
+          bestDist = dist;
+        }
+      };
       for (const pd of probeDists) {
         const cand = pos - pd;
         if (cand < buildFrom || pd > 32768) continue;
-        const l = matchLen(data, cand, pos, maxL);
-        if (l >= 3) {
-          candLen[base + kept] = l;
-          candDist[base + kept] = pd;
-          kept++;
-          if (l > best) best = l;
-          if (kept >= CANDS || best >= goodLen) break;
-        }
+        consider(pd, matchLen(data, cand, pos, maxL));
+        if (best >= goodLen) break;
       }
-      let cand = head[hash3(data, pos)];
-      let chain = maxChain;
-      while (cand >= buildFrom && cand < pos && chain-- > 0) {
-        if (best >= 64) chain = Math.min(chain, 8);
-        const dist = pos - cand;
-        if (dist > 32768) break;
-        if (data[cand + best] === data[pos + best]) {
-          const l = matchLen(data, cand, pos, maxL);
-          if (l >= 3 && (l > best || kept === 0)) {
-            candLen[base + kept] = l;
-            candDist[base + kept] = dist;
-            kept++;
-            if (l > best) best = l;
-            if (kept >= CANDS || best >= goodLen) break;
+      if (best < goodLen) {
+        let cand = head[hash3(data, pos)];
+        let chain = maxChain;
+        while (cand >= buildFrom && cand < pos && chain-- > 0) {
+          if (best >= 64) chain = Math.min(chain, 8);
+          const dist = pos - cand;
+          if (dist > 32768) break;
+          if (data[cand + best] === data[pos + best]) {
+            const l = matchLen(data, cand, pos, maxL);
+            if (l >= 3) {
+              consider(dist, l);
+              if (best >= goodLen) break;
+            }
           }
+          cand = prev[cand];
         }
-        cand = prev[cand];
       }
-      counts[i] = kept;
+      maxLenA[i] = best >= 3 ? best : 0;
+      maxDistA[i] = bestDist;
     }
     if (pos + 2 < end) {
       const h = hash3(data, pos);
@@ -625,7 +639,7 @@ function findCandidates(data, start, end, maxChain, goodLen, probeDists) {
       head[h] = pos;
     }
   }
-  return { counts, candLen, candDist };
+  return { subDist, maxLenA, maxDistA };
 }
 
 function tokenFreqs(tokens) {
@@ -647,12 +661,10 @@ function greedyTokens(data, start, end, cand) {
   const n = end - start;
   let i = 0;
   while (i < n) {
-    const c = cand.counts[i];
-    if (c > 0) {
-      let bi = 0;
-      for (let k = 1; k < c; k++) if (cand.candLen[i * CANDS + k] > cand.candLen[i * CANDS + bi]) bi = k;
-      tokens.push({ len: cand.candLen[i * CANDS + bi], dist: cand.candDist[i * CANDS + bi] });
-      i += cand.candLen[i * CANDS + bi];
+    const l = cand.maxLenA[i];
+    if (l >= 3) {
+      tokens.push({ len: l, dist: cand.maxDistA[i] });
+      i += l;
     } else {
       tokens.push({ lit: data[start + i] });
       i++;
@@ -687,40 +699,28 @@ function dpTokens(data, start, end, cand, litLen, distLen) {
       cost[i + 1] = lc;
       pickLen[i + 1] = 0;
     }
-    const cnt = cand.counts[i];
-    if (cnt === 0) continue;
     const maxL = Math.min(258, end - pos);
-    for (let s = 0; s < SUB_LENGTHS.length; s++) {
+    const cb = i * NCLASS;
+    for (let s = 0; s < NCLASS; s++) {
       const l = SUB_LENGTHS[s];
       if (l > maxL) break;
-      let best = Infinity;
-      let bestD = 0;
-      for (let k = 0; k < cnt; k++) {
-        if (cand.candLen[i * CANDS + k] >= l) {
-          const d = cand.candDist[i * CANDS + k];
-          const c = distCost[d];
-          if (c < best) {
-            best = c;
-            bestD = d;
-          }
-        }
-      }
-      if (best === Infinity) continue;
-      const c = base + lenCost[l] + best;
-      if (c < cost[i + l]) {
-        cost[i + l] = c;
-        pickLen[i + l] = l;
-        pickDist[i + l] = bestD;
-      }
-    }
-    for (let k = 0; k < cnt; k++) {
-      const l = cand.candLen[i * CANDS + k];
-      const d = cand.candDist[i * CANDS + k];
+      const d = cand.subDist[cb + s];
+      if (d === 0) continue;
       const c = base + lenCost[l] + distCost[d];
       if (c < cost[i + l]) {
         cost[i + l] = c;
         pickLen[i + l] = l;
         pickDist[i + l] = d;
+      }
+    }
+    const ml = cand.maxLenA[i];
+    if (ml >= 3 && ml <= maxL) {
+      const d = cand.maxDistA[i];
+      const c = base + lenCost[ml] + distCost[d];
+      if (c < cost[i + ml]) {
+        cost[i + ml] = c;
+        pickLen[i + ml] = ml;
+        pickDist[i + ml] = d;
       }
     }
   }
@@ -868,7 +868,7 @@ function deflateOptimal(data, rowLen) {
     }
     const cand = findCandidates(data, start, end, DP_CHAIN, 96, probeDists);
     let tokens = greedyTokens(data, start, end, cand);
-    for (let round = 0; round < 2; round++) {
+    for (let round = 0; round < 3; round++) {
       const { litFreq, distFreq } = tokenFreqs(tokens);
       for (let i = 0; i < 286; i++) litFreq[i] += 1;
       for (let i = 0; i < 30; i++) distFreq[i] += 1;
@@ -961,11 +961,11 @@ function squeeze(image) {
     if (idat === null || total < idat.total) idat = { total, form, stream };
   };
   for (const opts of FINAL_OPTS) consider(best.form, deflateSync(best.data, opts));
-  // On unfiltered multi-byte streams the optimal parse measured worse than
-  // zlib on every practice image, so it is skipped there (zlib stands).
-  if (!(best.choice === 0 && best.form.bpp >= 3)) {
-    consider(best.form, deflateOptimal(best.data, best.form.bpp === 1 ? width + 1 : 0));
-  }
+  // The per-class candidate cache fixed the optimal parse's weakness on
+  // unfiltered multi-byte streams (it now beats zlib there too), so the
+  // winner always gets the optimal-parsing treatment; `consider` keeps the
+  // minimum anyway.
+  consider(best.form, deflateOptimal(best.data, best.form.bpp === 1 ? width + 1 : 0));
   // When the brute-force row choice screened within a percent of the winner,
   // its stream gets the optimal-parsing treatment too: the two can stack.
   if (bestBrute !== null && bestBrute.data !== best.data && bestBrute.bytes <= best.bytes * 1.01) {
