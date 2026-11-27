@@ -306,14 +306,17 @@ function signedSum(row) {
 /**
  * The filtered raw stream of an image: each row behind its filter byte.
  * `choice` is a fixed filter type, 'minsum' (least signed sum per row),
- * 'pairs' (fewest distinct neighbouring byte pairs per row) or 'brute'
+ * 'pairs' (fewest distinct neighbouring byte pairs per row), 'brute'
  * (per row, the filter whose row compresses smallest against the 32 KiB of
- * stream already written, weighed with zlib at level 4).
+ * stream already written, weighed with zlib at level 4) or 'oracle' (the
+ * same per-row choice weighed at level 6, a closer proxy for the final
+ * encoder, which flips some rows and wins on rich images).
  */
 function filtered(samples, width, height, bpp, choice) {
   const stride = width * bpp;
   const raw = new Uint8Array(height * (stride + 1));
-  if (choice === 'brute') {
+  if (choice === 'brute' || choice === 'oracle') {
+    const level = choice === 'oracle' ? 6 : 4;
     const trial = Array.from({ length: 5 }, (_, t) => {
       const row = new Uint8Array(stride + 1);
       row[0] = t;
@@ -329,8 +332,8 @@ function filtered(samples, width, height, bpp, choice) {
       for (let t = 0; t < 5; t++) {
         filterRow(t, cur, prev, bpp, trial[t].subarray(1));
         const z = before.length === 0
-          ? deflateSync(trial[t], { level: 4, memLevel: 9 })
-          : deflateSync(trial[t], { level: 4, memLevel: 9, dictionary: before });
+          ? deflateSync(trial[t], { level, memLevel: 9 })
+          : deflateSync(trial[t], { level, memLevel: 9, dictionary: before });
         if (z.length < best) {
           best = z.length;
           type = t;
@@ -388,14 +391,15 @@ function filtered(samples, width, height, bpp, choice) {
 }
 
 // ------------------------------------------------------- optimal deflate
-// A zopfli-style deflate encoder: per 512 KiB segment, one match-finding pass
-// caches up to four candidate matches per position (structurally likely
-// distances — the byte before, one and two rows up — are probed first, which
-// raises the bar so the hash-chain walk rejects most candidates at once);
-// a greedy parse prices the first Huffman table, then two shortest-path (DP)
-// parses reprice from the previous parse's table. Segments are emitted as
-// dynamic-Huffman blocks (fixed-Huffman when it measures smaller). The result
-// is a plain zlib stream; callers keep it only when it beats zlib's own.
+// A zopfli-style deflate encoder: per 256 KiB segment, one match-finding
+// pass caches, for every useful length class, the nearest distance whose
+// match reaches that length, plus the longest match (structurally likely
+// distances — the byte before, one and two rows up — are probed first); a
+// greedy parse prices the first Huffman table, then three shortest-path
+// (DP) parses reprice from the previous parse's table. Segments are
+// emitted as dynamic-Huffman blocks (fixed-Huffman when it measures
+// smaller). The result is a plain zlib stream; callers keep it only when
+// it beats zlib's own, and it is inflate-verified before use.
 
 const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
 const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
@@ -415,7 +419,13 @@ for (let c = 0; c < 30; c++) {
 // each length-code extra-bit range (inside a range, longer is never dearer).
 const SUB_LENGTHS = [3, 4, 5, 6, 7, 8, 9, 10, 18, 34, 66, 130, 257, 258];
 
-/** Huffman code lengths for `freq`, none longer than maxBits (heap + zlib-style overflow fix). */
+/**
+ * Huffman code lengths for `freq`, none longer than maxBits, computed by the
+ * package-merge algorithm: optimal lengths with Kraft sum exactly 1 (for two
+ * or more used symbols). An earlier heap + clamp-and-repair version could
+ * leave the code over-subscribed (Kraft sum above 1) on skewed frequencies,
+ * which made invalid streams; package-merge cannot.
+ */
 function codeLengths(freq, maxBits) {
   const n = freq.length;
   const lengths = new Int32Array(n);
@@ -426,89 +436,34 @@ function codeLengths(freq, maxBits) {
     lengths[used[0]] = 1;
     return lengths;
   }
-  const heap = [];
-  const nodes = [];
-  const push = (item) => {
-    heap.push(item);
-    let i = heap.length - 1;
-    while (i > 0) {
-      const p = (i - 1) >> 1;
-      if (heap[p][0] <= heap[i][0]) break;
-      const t = heap[p];
-      heap[p] = heap[i];
-      heap[i] = t;
-      i = p;
+  // Items: { w, sym } for a leaf, { w, a, b } for a package of two items.
+  const leaves = used
+    .map((s) => ({ w: freq[s], sym: s }))
+    .sort((x, y) => x.w - y.w || x.sym - y.sym);
+  let current = leaves;
+  for (let depth = 1; depth < maxBits; depth++) {
+    const packages = [];
+    for (let i = 0; i + 1 < current.length; i += 2) {
+      packages.push({ w: current[i].w + current[i + 1].w, a: current[i], b: current[i + 1] });
+    }
+    const merged = [];
+    let i = 0;
+    let j = 0;
+    while (i < leaves.length || j < packages.length) {
+      if (j >= packages.length || (i < leaves.length && leaves[i].w <= packages[j].w)) merged.push(leaves[i++]);
+      else merged.push(packages[j++]);
+    }
+    current = merged;
+  }
+  const take = 2 * used.length - 2;
+  const count = (item) => {
+    if (item.sym !== undefined) lengths[item.sym]++;
+    else {
+      count(item.a);
+      count(item.b);
     }
   };
-  const pop = () => {
-    const top = heap[0];
-    const last = heap.pop();
-    if (heap.length) {
-      heap[0] = last;
-      let i = 0;
-      for (;;) {
-        const l = 2 * i + 1;
-        const r = l + 1;
-        let m = i;
-        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
-        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
-        if (m === i) break;
-        const t = heap[m];
-        heap[m] = heap[i];
-        heap[i] = t;
-        i = m;
-      }
-    }
-    return top;
-  };
-  for (const s of used) push([freq[s], s]);
-  while (heap.length > 1) {
-    const a = pop();
-    const b = pop();
-    const node = nodes.length;
-    nodes.push({ a, b });
-    push([a[0] + b[0], -1 - node]);
-  }
-  const depth = new Int32Array(n);
-  const walk = (item, d) => {
-    if (item[1] >= 0) {
-      depth[item[1]] = d;
-      return;
-    }
-    const node = nodes[-1 - item[1]];
-    walk(node.a, d + 1);
-    walk(node.b, d + 1);
-  };
-  walk(heap[0], 0);
-  const blCount = new Int32Array(maxBits + 2);
-  let overflow = 0;
-  for (const s of used) {
-    if (depth[s] > maxBits) {
-      depth[s] = maxBits;
-      overflow++;
-    }
-    blCount[depth[s]]++;
-  }
-  if (overflow > 0) {
-    while (overflow > 0) {
-      let m = maxBits - 1;
-      while (blCount[m] === 0) m--;
-      blCount[m]--;
-      blCount[m + 1] += 2;
-      blCount[maxBits]--;
-      overflow -= 2;
-    }
-    const sorted = [...used].sort((x, y) => freq[x] - freq[y]);
-    let idx = 0;
-    for (let bits = maxBits; bits >= 1; bits--) {
-      let cnt = blCount[bits];
-      while (cnt > 0) {
-        depth[sorted[idx++]] = bits;
-        cnt--;
-      }
-    }
-  }
-  for (const s of used) lengths[s] = depth[s];
+  for (let i = 0; i < take; i++) count(current[i]);
   return lengths;
 }
 
@@ -848,11 +803,18 @@ function adler32(data) {
   return ((b << 16) | a) >>> 0;
 }
 
-const DP_SEGMENT = 1 << 19; // 512 KiB of input per deflate block
-const DP_CHAIN = 256;
+const DP_SEGMENT = 1 << 18; // 256 KiB of input per deflate block
 
-/** Optimal-parsing deflate of `data` (filtered rows of row length `rowLen`) as a zlib stream. */
-function deflateOptimal(data, rowLen) {
+/**
+ * Optimal-parsing deflate of `data` (filtered rows of row length `rowLen`)
+ * as a zlib stream, or null if the result fails verification. `chain` caps
+ * the match search and `goodLen` is the match length that ends it: the
+ * search must not stop before the longest length classes are filled, or
+ * run-heavy streams lose their best matches. The produced stream is always
+ * inflate-checked against `data` before it may be used, so an encoder bug
+ * can only ever cost the zlib fallback, never an invalid output.
+ */
+function deflateOptimal(data, rowLen, chain, rounds) {
   const w = new BitWriter();
   w.bits(0x78, 8);
   w.bits(0x9c, 8);
@@ -866,9 +828,9 @@ function deflateOptimal(data, rowLen) {
       encodeFixedBlock(w, [], true);
       break;
     }
-    const cand = findCandidates(data, start, end, DP_CHAIN, 96, probeDists);
+    const cand = findCandidates(data, start, end, chain, 258, probeDists);
     let tokens = greedyTokens(data, start, end, cand);
-    for (let round = 0; round < 3; round++) {
+    for (let round = 0; round < rounds; round++) {
       const { litFreq, distFreq } = tokenFreqs(tokens);
       for (let i = 0; i < 286; i++) litFreq[i] += 1;
       for (let i = 0; i < 30; i++) distFreq[i] += 1;
@@ -889,12 +851,20 @@ function deflateOptimal(data, rowLen) {
   w.align();
   const ad = adler32(data);
   w.bytes.push((ad >>> 24) & 0xff, (ad >>> 16) & 0xff, (ad >>> 8) & 0xff, ad & 0xff);
-  return Uint8Array.from(w.bytes);
+  const stream = Uint8Array.from(w.bytes);
+  try {
+    const back = inflateSync(stream);
+    if (back.length !== data.length) return null;
+    for (let i = 0; i < data.length; i++) if (back[i] !== data[i]) return null;
+  } catch {
+    return null;
+  }
+  return stream;
 }
 
 // ---------------------------------------------------------------------- forms
 
-const CHANNEL_FILTERS = [0, 1, 2, 3, 4, 'minsum', 'pairs', 'brute'];
+const CHANNEL_FILTERS = [0, 1, 2, 3, 4, 'minsum', 'pairs', 'brute', 'oracle'];
 
 /** Every lossless form worth screening for this image. */
 function formsOf(rgba) {
@@ -930,7 +900,6 @@ const PNG_FIXED = 8 + 25 + 12 + 12; // signature + IHDR + IDAT wrapper + IEND
 
 const SCREEN_OPTS = { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY };
 const FINAL_OPTS = [
-  { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
   { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY },
   { level: 9, memLevel: 9, strategy: constants.Z_FILTERED },
 ];
@@ -939,7 +908,7 @@ const FINAL_OPTS = [
 function squeeze(image) {
   const { width, height, rgba } = image;
   let best = null;
-  let bestBrute = null;
+  let bestAlt = null;
   for (const form of formsOf(rgba)) {
     const extra = chunkBytes(form) + PNG_FIXED;
     for (const choice of form.filters) {
@@ -947,16 +916,20 @@ function squeeze(image) {
       const z = deflateSync(data, SCREEN_OPTS);
       const bytes = z.length + extra;
       if (best === null || bytes < best.bytes) best = { form, data, bytes, choice };
-      if (choice === 'brute' && (bestBrute === null || bytes < bestBrute.bytes)) bestBrute = { form, data, bytes, choice };
+      if ((choice === 'brute' || choice === 'oracle') && (bestAlt === null || bytes < bestAlt.bytes)) {
+        bestAlt = { form, data, bytes, choice };
+      }
     }
   }
-  // Final encodings of the screen winner: zlib at level 9 under three
+  // Final encodings of the screen winner: zlib at level 9 under two
   // settings, and the optimal-parsing deflate. Distance probes (the row
   // above) pay off only on one-byte-per-pixel streams, so they are enabled
-  // for those alone.
+  // for those alone. The match search runs deeper on one-byte streams,
+  // whose long runs reward it most.
   let winForm = best.form;
   let idat = null;
   const consider = (form, stream) => {
+    if (stream === null) return;
     const total = stream.length + chunkBytes(form) + PNG_FIXED;
     if (idat === null || total < idat.total) idat = { total, form, stream };
   };
@@ -965,11 +938,23 @@ function squeeze(image) {
   // unfiltered multi-byte streams (it now beats zlib there too), so the
   // winner always gets the optimal-parsing treatment; `consider` keeps the
   // minimum anyway.
-  consider(best.form, deflateOptimal(best.data, best.form.bpp === 1 ? width + 1 : 0));
-  // When the brute-force row choice screened within a percent of the winner,
-  // its stream gets the optimal-parsing treatment too: the two can stack.
-  if (bestBrute !== null && bestBrute.data !== best.data && bestBrute.bytes <= best.bytes * 1.01) {
-    consider(bestBrute.form, deflateOptimal(bestBrute.data, bestBrute.form.bpp === 1 ? width + 1 : 0));
+  const dpOf = (entry, chain) =>
+    deflateOptimal(entry.data, entry.form.bpp === 1 ? width + 1 : 0, chain, 3);
+  consider(best.form, dpOf(best, best.form.bpp === 1 ? 1024 : 384));
+  // When a per-row adaptive stream (brute/oracle) screened within two
+  // percent of the winner, it gets the optimal-parsing treatment too: the
+  // row choice and the parse can stack. Exception: when an unfiltered
+  // stream won the screen outright, an adaptive stream that did not come
+  // within half a percent is not chased — on flat and grey images those
+  // parses have never overturned the unfiltered winner, and each costs
+  // seconds of the set's wall clock.
+  if (
+    bestAlt !== null &&
+    bestAlt.data !== best.data &&
+    bestAlt.bytes <= best.bytes * 1.02 &&
+    !(best.choice === 0 && bestAlt.bytes > best.bytes * 0.995)
+  ) {
+    consider(bestAlt.form, dpOf(bestAlt, bestAlt.form.bpp === 1 ? 512 : 384));
   }
   winForm = idat.form;
   const chunks = [['IHDR', ihdrOf(width, height, winForm.colourType)]];
